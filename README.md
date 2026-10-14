@@ -4,6 +4,8 @@
 
 **[下载原生版 APK](https://github.com/N3urda/hongguoTV-updates/releases/latest)** · [原生版说明与构建](kotlin-tv/README.md)
 
+0.10.0 切换轻量签名（随机设备身份）并把首页/分类迁移到 App 目录接口（landpage/v 游标分页），新增 AI 剧分类；见 [本版交付说明](kotlin-tv/RELEASE_0.10.0.md)。
+
 0.9.0 增加应用内更新：推送原生代码后自动同步至公开发布仓库、构建签名 APK；电视在浏览时检查并下载新版，确认系统安装即可，无需逐次传文件。播放中不检查，覆盖安装保留本机记录。见 [自动更新说明](kotlin-tv/AUTO_UPDATES.md)。
 
 原生工程位于 `kotlin-tv/`，包名 `com.hongguotv.nativeapp`，可与旧版并存。以下为保留的 React Native 版说明。
