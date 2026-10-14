@@ -55,51 +55,49 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     fun home(page: Int = 1, type: ContentType = ContentType.SHORT): CatalogPage {
         require(page in 1..100)
-        if(type==ContentType.COMIC) return comicRanking(page)
-        val data=router("$site/category?tab=1&sort_type=1"+if(page>1) "&page=$page" else "")
-        val section=data.optJSONObject("category_page") ?: data.optJSONObject("category_$") ?: throw IOException("首页数据结构已变化")
-        val rows=section.optJSONArray("recommendList") ?: section.optJSONObject("categoryData")?.optJSONArray("recommendList") ?: throw IOException("首页数据暂不可用")
-        val items=valid(rows.objects().map(::card))
-        val lastPage=section.optJSONObject("pagination")?.optInt("totalPages",100) ?: 100
-        return CatalogPage(items,items.isNotEmpty() && page<minOf(lastPage,100))
+        // The website category page no longer carries data for every genre; browse the
+        // app landpage/v catalog with server cursors (adapted from jipinwa/hongguo).
+        return catalog(type,page)
     }
-    fun search(keyword: String, page: Int = 1, type: ContentType = ContentType.SHORT): CatalogPage {
-        require(keyword.isNotBlank() && keyword.length<=80 && page in 1..100)
-        // The old search/tab/v endpoint returns an empty 200 for any signature now.
-        // Short dramas: website search. Comics: signed landpage catalog filtered by genre.
-        if(type==ContentType.COMIC) return comicCatalog(keyword,page)
-        val data=router("$site/search/${SignerLight.encode(keyword)}?page=$page")
-        val section=data.optJSONObject("search_(keyword)/page") ?: data.optJSONObject("search_page") ?: throw IOException("搜索数据暂不可用")
-        val rows=section.optJSONArray("searchList") ?: throw IOException("搜索数据结构已变化")
-        val items=valid(rows.objects().map(::card))
-        return CatalogPage(items,items.isNotEmpty() && page<100)
+    /** Server-cursor state for one landpage/v genre feed (adapted from jipinwa/hongguo
+     *  provider_hongguo_catalog.go): offset + session_id advance forward only. */
+    private class FeedCursor {
+        var offset=0; var sessionId=""; var pageSignature=""; var exhausted=false; var updatedAt=0L
+        val rows=mutableListOf<Series>(); val pageEnds=mutableListOf<Int>()
     }
-    private fun comicCatalog(keyword: String, page: Int): CatalogPage {
-        // landpage/v cannot filter by title server-side; pull genre pages and match locally.
-        // Pagination beyond what we scanned reports no results rather than wrong ones.
-        val wanted=keyword.trim()
-        val collected= mutableListOf<Series>()
-        val maxScanPages=minOf(page+9,100)
-        for(scan in 1..maxScanPages) {
-            val rows=comicCatalogPage(scan)
-            collected+=valid(rows.objects().map(::card))
-            val hit=collected.filter { it.title.contains(wanted) || wanted.contains(it.title.take(12)) }.distinctBy { it.id }
-            if(hit.isNotEmpty() && scan>=page) return CatalogPage(hit,true)
+    private val feedCursors=linkedMapOf<ContentType,FeedCursor>()
+    private fun feedFor(type: ContentType): FeedCursor = synchronized(feedCursors) {
+        val existing=feedCursors[type]
+        // Sessions older than 30 minutes are no longer honored by the server; rebuild from page 1.
+        if(existing!=null && existing.pageEnds.isNotEmpty() && clock()-existing.updatedAt>30*60*1000) feedCursors.remove(type)
+        feedCursors.getOrPut(type) { FeedCursor().also { it.updatedAt=clock() } }
+    }
+    /** Serve one page of a genre feed. The server feed is forward-only, so fetched rows
+     *  accumulate locally: 上一页 serves cached rows, 下一页 fetches forward. */
+    private fun catalog(type: ContentType,page: Int): CatalogPage {
+        val feed=feedFor(type)
+        synchronized(feed) {
+            while(feed.pageEnds.size<page && !feed.exhausted) fetchFeedPage(type,feed)
+            if(page>feed.pageEnds.size) return CatalogPage(emptyList(),false)
+            val start=if(page==1) 0 else feed.pageEnds[page-2]
+            val end=feed.pageEnds[page-1]
+            val hasMore=page<feed.pageEnds.size || !feed.exhausted
+            return CatalogPage(feed.rows.subList(start,end).toList(),hasMore)
         }
-        return CatalogPage(emptyList(),false)
     }
-    private fun comicCatalogPage(page: Int): JSONArray {
+    /** Fetch the next landpage/v page; advances the cursor only on a valid, advancing response. */
+    private fun fetchFeedPage(type: ContentType,feed: FeedCursor): List<Series> {
         val payload=JSONObject().apply {
-            put("req_scene","comic_series")
-            put("offset",(page-1)*20)
+            put("req_scene",type.scene)
+            put("offset",feed.offset)
             put("limit",20)
             put("req_type","only_content")
             put("need_selector_panel",false)
-            put("client_req_type",if(page>1) 2 else 3)
-            put("session_id","")
+            put("client_req_type",if(feed.offset>0) 2 else 3)
+            put("session_id",feed.sessionId)
             put("filter_ids","")
             put("select_items",JSONObject().apply {
-                put("genre",JSONArray().put("comic_series"))
+                put("genre",JSONArray().put(type.genre))
                 put("sort",JSONArray().put("online_time"))
                 put("gender",JSONArray())
                 put("category_dim_theme",JSONArray())
@@ -111,9 +109,49 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         }
         val signed=lightSigner.sign("https://api5-normal-sinfonlineb.fqnovel.com/reading/distribution/category/landpage/v/",VendorConstants.device,payload.toString().toByteArray())
         val data=JSONObject(text(signed.url,signed))
-        if(data.optInt("code",-1)!=0 && data.optInt("Code",-1)!=0) throw IOException("漫剧目录暂不可用")
-        val section=data.optJSONObject("data") ?: throw IOException("漫剧目录格式异常")
-        return section.optJSONArray("video_data") ?: section.optJSONArray("cards") ?: JSONArray()
+        if(data.optInt("code",-1)!=0 && data.optInt("Code",-1)!=0) throw IOException("分类目录暂不可用")
+        val section=data.optJSONObject("data") ?: throw IOException("分类目录格式异常")
+        val raw=section.optJSONArray("video_data") ?: throw IOException("分类目录未返回剧集")
+        val rows=valid(raw.objects().map(::card))
+        val hasMore=section.optBoolean("has_more",false)
+        val next=section.optInt("next_offset",-1)
+        val session=section.str("session_id")
+        if(session.length>4096 || session.any { it=='\r' || it=='\n' || it=='\u0000' }) throw IOException("分类分页会话无效，已保留上次位置")
+        val signature=raw.objects().map { it.str("series_id") }.filter { it.isNotEmpty() }.sorted().joinToString("\n")
+            .toByteArray(Charsets.UTF_8).let { java.security.MessageDigest.getInstance("SHA-256").digest(it).joinToString("") { b -> "%02x".format(b) } }
+        if(hasMore && (raw.length()==0 || next<=feed.offset || next>1_000_000 || signature==feed.pageSignature)) throw IOException("分类分页未前进，已保留上次位置")
+        feed.rows+=rows; feed.pageEnds+=feed.rows.size
+        feed.offset=if(hasMore) next else feed.offset
+        feed.sessionId=session; feed.pageSignature=signature
+        feed.exhausted=!hasMore; feed.updatedAt=clock()
+        return rows
+    }
+    fun search(keyword: String, page: Int = 1, type: ContentType = ContentType.SHORT): CatalogPage {
+        require(keyword.isNotBlank() && keyword.length<=80 && page in 1..100)
+        // The old search/tab/v endpoint returns an empty 200 for any signature now.
+        // Short dramas and AI dramas: website search. Comics: genre feed filtered locally.
+        if(type==ContentType.COMIC) return genreFeedSearch(keyword,page,type)
+        val data=router("$site/search/${SignerLight.encode(keyword)}?page=$page")
+        val section=data.optJSONObject("search_(keyword)/page") ?: data.optJSONObject("search_page") ?: throw IOException("搜索数据暂不可用")
+        val rows=section.optJSONArray("searchList") ?: throw IOException("搜索数据结构已变化")
+        val items=valid(rows.objects().map(::card))
+        return CatalogPage(items,items.isNotEmpty() && page<100)
+    }
+    private fun genreFeedSearch(keyword: String, page: Int, type: ContentType): CatalogPage {
+        // landpage/v cannot filter by title server-side; pull genre feed pages and match locally.
+        // Pagination beyond what we scanned reports no results rather than wrong ones.
+        val wanted=keyword.trim()
+        val feed=feedFor(type)
+        synchronized(feed) {
+            val maxScanPages=minOf(page+9,100)
+            for(scan in 1..maxScanPages) {
+                while(feed.pageEnds.size<scan && !feed.exhausted) fetchFeedPage(type,feed)
+                if(feed.pageEnds.size<scan) break
+                val hit=feed.rows.filter { it.title.contains(wanted) || wanted.contains(it.title.take(12)) }.distinctBy { it.id }
+                if(hit.isNotEmpty() && scan>=page) return CatalogPage(hit,true)
+            }
+            return CatalogPage(emptyList(),false)
+        }
     }
     fun detail(id: String): Detail {
         require(id.matches(Regex("[0-9]{1,30}")))
