@@ -425,15 +425,9 @@ class MainActivity: Activity() {
                     return@work
                 }
                 catalog=emptyList(); hasMore=false; ranking=null; rankSubtitle?.text="榜单加载失败"
-                if(problem is SearchSessionExpiredException) {
-                    page=1; catalogFocus=""
-                    Toast.makeText(this,"搜索结果已过期，已回到第 1 页刷新",Toast.LENGTH_LONG).show()
-                    showCatalog(true)
-                } else {
-                    body.removeAllViews()
-                    error(body,problem) { showCatalog(true) }
-                    if(resumeCards.isNotEmpty()) resumeCards.first().requestFocus()
-                }
+                body.removeAllViews()
+                error(body,problem) { showCatalog(true) }
+                if(resumeCards.isNotEmpty()) resumeCards.first().requestFocus()
             })
         } else catalogGrid(body,focusNav,focusType)
     }

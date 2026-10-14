@@ -10,33 +10,33 @@
 */
 
 // 红果果[短]：全自包含红果短剧源（不依赖 hongguo-bridge 等本地插件）。
-// 数据层：官网(hongguoduanju.com) SSR _ROUTER_DATA 做短剧分类/榜单/详情，
-//        番茄小说 App API(bookapi/search/tab) 做真人剧/漫剧/AI剧分类与搜索——需字节系全套签名头。
-// 签名层：x-gorgon/x-ladon/x-helios/x-medusa 全套纯 JS 实现（SM3/变种MD5/自研哈希三分支/手写protobuf/自定义AES变体），
-//         算法块自实测可用的 Fastify 版(1:1)移植，勿随意改动常量与位运算顺序。
-// 播放层：video_model 拿清晰度 → fallback_api 拿 video_list → spade URL 解密 → spade_a 派生 CENC 内容密钥；
+// 数据层：官网(hongguoduanju.com) SSR _ROUTER_DATA 做短剧分类/榜单/详情/搜索，
+//        番茄小说 App API 做播放取流(video_model/v1)与漫剧目录(landpage/v)——轻量 x-gorgon 签名。
+// 签名层：轻量 X-Gorgon（MD5+异或置换，20 字节 payload）+ X-Khronos + X-SS-Req-Ticket，
+//         改编自 jipinwa/hongguo (provider_hongguo_sign.go)。旧的 drpys 全套签名
+//         (x-gorgon/helios/medusa/ladon/argus + 硬编码设备指纹) 已被平台封禁：
+//         multi_video_model 与 bookapi/search 现对任意签名返回空 200。
+// 播放层：video_model/v1 直接返回 video_list（明文 main_url，无 fallback 链），spade_a 派生 CENC 内容密钥；
 //        proxy_rule 按客户端 __range 拉远端 1MB 段、AES-128-CTR 逐样本解密后 base64 回传（206 分段，免落盘秒开）。
-// 依赖沙箱能力：require('node:crypto')（rootRequire 直通）、Buffer、axios；Node<18 无 SM3 会签名失败。
+// 依赖沙箱能力：require('node:crypto')（rootRequire 直通）、Buffer、axios。
 
 const crypto = require('node:crypto');
 
 const SITE = 'https://hongguoduanju.com';
-const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
-const APP_SEARCH_API = 'https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v';
-const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
-const APP_UA = 'com.phoenix.read/72232 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)';
+const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/video_model/v1/';
+const LANDPAGE_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/distribution/category/landpage/v/';
+const VIDEO_UA = 'com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
+// 每进程随机设备身份（旧 drpys 硬编码 iid/device_id 已被平台封禁）。保持进程内稳定，
+// 便于分页会话与签名一致；换进程/重启即换新身份。
 const DEVICE = {
-    iid: '1905892595382586', device_id: '1905892595378490', ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
-    version_code: '71332', version_name: '7.1.3.32', device_platform: 'android', os: 'android',
+    iid: newDeviceId(), device_id: newDeviceId(), ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
+    version_code: '73532', version_name: '7.3.5.32', device_platform: 'android', os: 'android',
     ssmix: 'a', device_type: '25053RT47C', device_brand: 'Redmi', language: 'zh', os_api: '36',
-    os_version: '16', manifest_version_code: '71332', resolution: '1280*2772', dpi: '520',
-    update_version_code: '71332', host_abi: 'arm64-v8a', dragon_device_type: 'phone', pv_player: '71332',
+    os_version: '16', manifest_version_code: '73532', resolution: '1280*2772', dpi: '520',
+    update_version_code: '73532', host_abi: 'arm64-v8a', dragon_device_type: 'phone', pv_player: '73532',
     compliance_status: '0', need_personal_recommend: '1', player_so_load: '1', is_android_pad_screen: '0',
 };
-const APP_DEVICE = {
-    ...DEVICE, version_code: '72232', version_name: '7.2.2.32', manifest_version_code: '72232',
-    update_version_code: '72232', pv_player: '72232',
-};
+const APP_DEVICE = { ...DEVICE };
 const SELECTOR_GROUPS = [
     { key: 'background', name: '全部背景', items: [['现代', 'cate_757'], ['都市', 'cate_1'], ['古代', 'cate_758'], ['乡村', 'cate_11'], ['年代', 'cate_79'], ['架空', 'cate_452'], ['职场', 'cate_127'], ['民国', 'cate_390'], ['校园', 'cate_4'], ['宫廷', 'cate_1153'], ['荒岛', 'cate_1162']] },
     { key: 'topic', name: '全部主题', items: [['现言', 'cate_1021'], ['女性成长', 'cate_1048'], ['脑洞', 'cate_262'], ['奇幻', 'cate_1020'], ['玄幻', 'cate_1019'], ['古言', 'cate_439'], ['战神', 'cate_1038'], ['宫斗', 'cate_246'], ['仙侠', 'cate_1013'], ['权谋', 'cate_1047'], ['种田', 'cate_1180'], ['年代爱情', 'cate_1022'], ['悬疑', 'cate_165'], ['喜剧', 'cate_303'], ['青春', 'cate_297'], ['志怪', 'cate_1027'], ['民国爱情', 'cate_1025'], ['灵异', 'cate_751'], ['家国情怀', 'cate_1235'], ['法律', 'cate_1136'], ['刑侦', 'cate_1148'], ['抗战', 'cate_504'], ['武侠', 'cate_1172'], ['民国传奇', 'cate_1240'], ['动作', 'cate_302'], ['求生', 'cate_1168'], ['科幻', 'cate_1092'], ['恐怖', 'cate_1219'], ['商战', 'cate_1225']] },
@@ -71,6 +71,8 @@ const videoInfoCache = new Map();
 const appSearchCache = new Map();
 
 function str(value, fallback = '') { return String(value == null ? fallback : value).trim(); }
+// 18-19 位十进制设备 ID，范围与 jipinwa/hongguo newHongguoDeviceID 一致。
+function newDeviceId() { return String(1000000000000000000n + BigInt('0x' + crypto.randomBytes(8).toString('hex')) % 8000000000000000000n); }
 function pageNumber(value) { const n = Number.parseInt(value, 10); return Number.isFinite(n) && n > 0 ? n : 1; }
 function cleanUrl(value) { return str(value).replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&'); }
 function jsonBody(value) { try { return JSON.parse(value); } catch { return null; } }
@@ -235,10 +237,50 @@ function appFilterKeyword(config, filters) {
     return [config.keyword, ...names].filter(Boolean).join(' ');
 }
 
+// landpage/v 无法按标题过滤：按 genre 拉取目录页后在本地匹配标题。
+// 旧 bookapi/search/tab 已下线（对任意签名返回空 200）。
+const LANDPAGE_GENRES = { 11: 'short_play', 19: 'comic_series' };
+
+function landpagePayload(genre, page, limit) {
+    return JSON.stringify({
+        req_scene: genre === 'comic_series' ? 'comic_series' : (genre === 'ai_series' ? 'ai_series' : ''),
+        offset: Math.max(0, (page - 1) * limit), limit, req_type: 'only_content', need_selector_panel: false,
+        client_req_type: page > 1 ? 2 : 3, session_id: '', filter_ids: '',
+        select_items: {
+            genre: [genre], sort: ['online_time'], gender: [],
+            category_dim_theme: [], category_dim_role: [], category_dim_epoch: [],
+            online_time: [], creation_status: [],
+        },
+    });
+}
+
+async function landpagePage(genre, page = 1, limit = 20) {
+    const cacheKey = `landpage|${genre}|${page}`; const cached = appSearchCache.get(cacheKey);
+    if (cached && Date.now() - cached.time < 300000) return cached.value;
+    const signed = signedAppRequest(LANDPAGE_API, landpagePayload(genre, page, limit));
+    const resp = await axios.post(signed.url, signed.body, { headers: signed.headers, timeout: 20000, responseType: 'text' });
+    const data = jsonBody(resp.data);
+    if (resp.status !== 200 || !data || Number(data.Code || data.code || 0) !== 0) throw new Error(`landpage failed: ${data?.Message || data?.message || resp.status}`);
+    const section = data.data || {};
+    const rows = Array.isArray(section.video_data) ? section.video_data : Array.isArray(section.cards) ? section.cards : [];
+    const list = []; const seen = new Set();
+    for (const row of rows) {
+        if (!row || typeof row !== 'object') continue;
+        const id = str(row.series_id); const title = str(row.title);
+        if (!id || !title || !/^\d+$/.test(id) || seen.has(id)) continue;
+        seen.add(id);
+        list.push({
+            url: id, title, img: cleanUrl(str(row.cover || row.vertical)),
+            desc: row.episode_cnt ? `全${row.episode_cnt}集` : '', tname: str(row.video_desc), content: str(row.video_desc),
+        });
+    }
+    const value = { list, hasMore: rows.length >= limit };
+    appSearchCache.set(cacheKey, { time: Date.now(), value }); return value;
+}
+
 async function appCategoryPage(typeId, config, filters, page) {
-    const keyword = appFilterKeyword(config, filters);
-    let result = await appSearchPage(keyword, config.tabType, page, PAGE_SIZE);
-    if (!result.list.length && keyword !== config.keyword) result = await appSearchPage(config.keyword, config.tabType, page, PAGE_SIZE);
+    const genre = LANDPAGE_GENRES[config.tabType] || 'short_play';
+    const result = await landpagePage(genre, page, PAGE_SIZE);
     return {
         page, pagecount: result.hasMore ? page + 1 : page, limit: PAGE_SIZE,
         total: (page - 1) * PAGE_SIZE + result.list.length + (result.hasMore ? 1 : 0), list: result.list,
@@ -283,28 +325,17 @@ function appSearchVod(cell) {
 }
 
 async function appSearchPage(keyword, tabType, page = 1, limit = 20) {
-    const cacheKey = `${tabType}|${keyword}|${page}`; const cached = appSearchCache.get(cacheKey);
-    if (cached && Date.now() - cached.time < 300000) return cached.value;
-    let cursor = {};
-    if (page > 1) {
-        const previous = await appSearchPage(keyword, tabType, page - 1, limit);
-        cursor = previous.cursor || {};
+    const genre = LANDPAGE_GENRES[tabType] || 'short_play';
+    const wanted = str(keyword);
+    // 本地匹配：扫描目录页直到命中；未命中返回空，不冒充结果。
+    const collected = []; const seen = new Set(); const maxScan = Math.min(page + 9, 100);
+    for (let scan = 1; scan <= maxScan; scan += 1) {
+        const result = await landpagePage(genre, scan, limit);
+        for (const vod of result.list) { if (!seen.has(vod.url)) { seen.add(vod.url); collected.push(vod); } }
+        const hits = collected.filter((vod) => vod.title.includes(wanted) || wanted.includes(vod.title.slice(0, 12)));
+        if (hits.length && scan >= page) return { list: hits, hasMore: true, cursor: {} };
     }
-    const data = await signedAppGet(appSearchParams(keyword, tabType, limit, cursor, page));
-    const tabs = Array.isArray(data.search_tabs) ? data.search_tabs : Array.isArray(data.data?.search_tabs) ? data.data.search_tabs : [];
-    const tab = tabs.find((item) => Number(item?.tab_type) === Number(tabType)) || {};
-    const list = []; const seen = new Set();
-    for (const cell of Array.isArray(tab.data) ? tab.data : []) {
-        for (const item of appSearchCells(cell)) {
-            const vod = appSearchVod(item);
-            if (vod && !seen.has(vod.url)) { seen.add(vod.url); list.push(vod); }
-        }
-    }
-    const value = {
-        list, hasMore: Boolean(tab.has_more),
-        cursor: { search_id: str(tab.search_id), passback: str(tab.passback), next_offset: str(tab.next_offset) },
-    };
-    appSearchCache.set(cacheKey, { time: Date.now(), value }); return value;
+    return { list: [], hasMore: false, cursor: {} };
 }
 
 // ---------- 字节系签名算法（实测黑盒，勿改常量/位序） ----------
@@ -400,48 +431,56 @@ function helios(khronos) {
     return Buffer.concat([le32(random), ...output]).toString('base64');
 }
 
-function branchOf(url, body, khronos) { const bodyMd5 = body ? crypto.createHash('md5').update(body).digest() : Buffer.alloc(16); const q = sm3(url.split('?')[1]); const iv = getIv(getIv(getIv(0x20230928, q), bodyMd5), le32(khronos)); const low = iv & 15; return low - (((low * 171) >> 9) * 3); }
-async function signedAppGet(values) {
-    const khronos = Math.floor(Date.now() / 1000); const ticket = Date.now();
-    const query = pythonUrlEncode({ ...values, ts: String(khronos), _rticket: String(ticket) });
-    const url = `${APP_SEARCH_API}?${query}`;
-    const random = Math.floor(Math.random() * 65536); const body = null;
-    const headers = {
-        'User-Agent': APP_UA, Accept: 'application/json; charset=utf-8,application/x-protobuf',
-        'x-ss-req-ticket': String(ticket), 'x-tt-request-tag': 't=0;n=0', 'sdk-version': '2',
-        'passport-sdk-version': '50561', 'x-xs-from-web': '0', 'x-khronos': String(khronos),
-        'x-ladon': be32(khronos).toString('base64'), 'x-argus': le32(khronos).toString('base64'),
-        'x-gorgon': xGorgon(query, body, khronos, random), 'x-helios': helios(khronos),
-        'x-medusa': buildMedusa(url, body, khronos), 'x-tt-dt': '',
-    };
-    const resp = await axios(url, { headers, timeout: 20000, responseType: 'text' });
-    const data = jsonBody(resp.data);
-    if (resp.status !== 200 || !data || Number(data.code) !== 0) throw new Error(`App search failed: ${data?.message || resp.status}`);
-    return data;
-}
 
 function videoModelUrl() { const query = new URLSearchParams({ ...DEVICE }); return `${VIDEO_API}?${query}`; }
 
-function signedVideoRequest(payload) {
-    const khronos = Math.floor(Date.now() / 1000); const body = Buffer.from(payload); const ticketBase = Date.now(); let requestTicket = ticketBase; let query = ''; let url = '';
-    // branch 1 的签名变体服务端不认：抖动 _rticket 找一个可用的 branch（最多试 32 秒偏移）
-    for (let offset = 0; offset < 32; offset += 1) { requestTicket = ticketBase + offset; const values = { ...DEVICE, ts: String(khronos), _rticket: String(requestTicket) }; query = pythonUrlEncode(values); url = `${VIDEO_API}?${query}`; if (branchOf(url, body, khronos) !== 1) break; }
-    const random = Math.floor(Math.random() * 65536); const headers = {
-        'User-Agent': VIDEO_UA, Accept: 'application/json; charset=utf-8,application/x-protobuf', 'Content-Type': 'application/json; charset=UTF-8',
-        'x-xs-from-web': '0', 'x-ss-req-ticket': String(requestTicket), 'x-tt-request-tag': 't=0;n=0', 'sdk-version': '2', 'passport-sdk-version': '50561',
-        'x-vc-bdturing-sdk-version': '3.7.2.cn', 'x-ss-stub': md5(body), 'x-gorgon': xGorgon(query, body, khronos, random),
-        'x-khronos': String(khronos), 'x-ladon': be32(khronos).toString('base64'), 'x-argus': le32(khronos).toString('base64'),
-        'x-helios': helios(khronos), 'x-medusa': buildMedusa(url, body, khronos), 'x-tt-dt': '',
+function rotl8(value, count) { const n = count & 7; return ((value << n) | (value >>> (8 - n))) & 255; }
+function rev8(value) { let out = 0; for (let bit = 0; bit < 8; bit += 1) { out = (out << 1) | (value & 1); value >>= 1; } return out & 255; }
+
+// 轻量签名：改编自 jipinwa/hongguo provider_hongguo_sign.go signHongguoRequest。
+// 仅 X-Gorgon + X-Khronos + X-SS-Req-Ticket（POST 另加 X-SS-STUB）。
+function signHongguoRequest(rawQuery, body, now = Date.now()) {
+    const khronos = Math.floor(now / 1000);
+    const payload = Buffer.alloc(20);
+    crypto.createHash('md5').update(rawQuery).digest().copy(payload, 0, 0, 4);
+    let stub = null;
+    if (body) {
+        const bodyHash = crypto.createHash('md5').update(body).digest();
+        bodyHash.copy(payload, 4, 0, 4);
+        stub = bodyHash.toString('hex').toUpperCase();
+    }
+    payload.set(Buffer.from([0, 6, 11, 28]), 12);
+    payload.writeUInt32BE(khronos, 16);
+    const key = Buffer.from([0x44, 0xb9, 0xb9, 0xd9, 0xa4, 0xae, 0xf9, 0xfc, 0xa4, 0x93, 0xaa, 0x75, 0x7c, 0xa3, 0xc2, 0xc4, 0xa4, 0x96, 0x93, 0x8f]);
+    for (let index = 0; index < payload.length; index += 1) payload[index] ^= key[index];
+    for (let index = 0; index < payload.length; index += 1) {
+        const mixed = rotl8(payload[index], 4) ^ payload[(index + 1) % payload.length];
+        payload[index] = rev8(mixed) ^ 0xff ^ payload.length;
+    }
+    const signature = Buffer.concat([Buffer.from([0x84, 0x04, 0x40, 0x1c, 0, 0]), payload]);
+    const headers = {
+        'User-Agent': VIDEO_UA, Accept: 'application/json',
+        'x-xs-from-web': '0', 'sdk-version': '2',
+        'x-khronos': String(khronos), 'x-gorgon': signature.toString('hex'), 'x-ss-req-ticket': String(now),
     };
-    return { url, headers, body };
+    if (stub) headers['content-type'] = 'application/json; charset=utf-8';
+    if (stub) headers['x-ss-stub'] = stub;
+    return { headers, query: rawQuery };
+}
+
+function signedAppRequest(path, payload, extraQuery = {}) {
+    const body = payload ? Buffer.from(payload) : null;
+    const query = new URLSearchParams({ ...DEVICE, ...extraQuery, _rticket: String(Date.now()) });
+    const signed = signHongguoRequest(query.toString(), body);
+    return { url: `${path}?${signed.query}`, headers: signed.headers, body };
 }
 
 async function requestVideoModel(vid) {
     const payload = JSON.stringify({
-        biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
-        mixed_video_id_map: { '1004': [str(vid)] },
+        video_id: str(vid), content_type: 1,
+        biz_param: { need_all_video_definition: true, video_platform: 3 },
     });
-    const signed = signedVideoRequest(payload);
+    const signed = signedAppRequest(VIDEO_API, payload);
     const resp = await axios.post(signed.url, signed.body, { headers: signed.headers, timeout: 20000, responseType: 'text' });
     const data = jsonBody(resp.data);
     if (resp.status !== 200 || !data || Number(data.Code || data.code || 0) !== 0) throw new Error(`video_model failed: ${data?.Message || data?.message || resp.status}`);
@@ -449,8 +488,11 @@ async function requestVideoModel(vid) {
 }
 
 function modelForVideo(data, vid) {
-    const map = data?.data || {};
-    const entry = map[str(vid)] || Object.values(map).find((value) => value && typeof value === 'object');
+    // video_model/v1: data.video_model 直接承载本集模型（对象或 JSON 字符串）。
+    const section = data?.data || {};
+    const entry = section.video_model !== undefined
+        ? section
+        : (section[str(vid)] || Object.values(section).find((value) => value && typeof value === 'object' && value.video_model !== undefined));
     if (!entry) throw new Error('video_model 没有对应视频');
     const model = typeof entry.video_model === 'string' ? jsonBody(entry.video_model) : entry.video_model;
     if (!model) throw new Error('video_model 内容为空');
@@ -476,10 +518,12 @@ function qualityLabel(value) {
 function qualityRows(videoList) {
     const rows = [];
     if (!videoList || typeof videoList !== 'object') return rows;
-    for (const [key, value] of Object.entries(videoList)) {
+    const entries = Array.isArray(videoList) ? videoList.map((value, index) => [String(index), value]) : Object.entries(videoList);
+    for (const [key, value] of entries) {
         const item = value && typeof value === 'object' ? value : {};
-        const quality = str(item.quality_desc || item.height || item.vheight || item.quality || key);
-        if (item.main_url && !rows.some((row) => row.quality === key)) rows.push({ key, quality, item });
+        const meta = item.video_meta && typeof item.video_meta === 'object' ? item.video_meta : {};
+        const quality = str(item.quality_desc || item.height || meta.definition || meta.vheight || item.vheight || item.quality || key);
+        if ((item.main_url || item.encrypt_info?.spade_a) && !rows.some((row) => row.quality === key)) rows.push({ key, quality, item });
     }
     return rows.sort((a, b) => qualityNumber(b.quality || b.key) - qualityNumber(a.quality || a.key));
 }
@@ -487,11 +531,9 @@ function qualityRows(videoList) {
 async function fetchVideoInfo(vid) {
     const cached = videoInfoCache.get(str(vid));
     if (cached && Date.now() - cached.time < 300000) return cached.value;
+    // video_model/v1 直接返回 video_list（明文 main_url），不再需要 fallback 链。
     const model = modelForVideo(await requestVideoModel(vid), vid);
-    const fallback = parseFallback(model.fallback_api);
-    if (!fallback) throw new Error('fallback_api 为空');
-    const outer = jsonBody(await getText(fallback));
-    const info = outer?.video_info?.data || {};
+    const info = { video_list: model.video_list || {} };
     const value = { model, info, rows: qualityRows(info.video_list) };
     videoInfoCache.set(str(vid), { time: Date.now(), value });
     return value;
@@ -675,11 +717,20 @@ function decryptPartial(data, start, key, prepared) {
 
 async function resolveStream(vid, quality) {
     const cacheKey = playKey(vid, quality); const cached = streamCache.get(cacheKey); if (cached && Date.now() - cached.time < 300000) return cached.value;
-    const { info, rows } = await fetchVideoInfo(vid); const wanted = str(quality, 'auto');
+    const { rows } = await fetchVideoInfo(vid); const wanted = str(quality, 'auto');
     const selected = rows.find((row) => row.key === wanted || qualityNumber(row.quality) === qualityNumber(wanted)) || rows[0]; if (!selected) throw new Error('没有可用清晰度');
-    let url = cleanUrl(selected.item.main_url); const seed = Buffer.from(str(info.key_seed), 'base64');
-    if (seed.length && url) url = decryptSpadeUrl(url, seed);
-    const result = { url, quality: qualityLabel(selected.quality || selected.key), key: selected.item.spade_a ? deriveContentKey(selected.item.spade_a) : null };
+    const item = selected.item;
+    let url = cleanUrl(str(item.main_url));
+    if (!url) {
+        // 加密条目可能把地址藏在 encrypt_info 或 backup_url 的 base64 里。
+        const candidate = str(item.encrypt_info?.main_url) || str(item.backup_url);
+        if (candidate) {
+            const decoded = Buffer.from(candidate.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+            if (/^https?:\/\//.test(decoded)) url = cleanUrl(decoded);
+        }
+    }
+    const spade = str(item.encrypt_info?.spade_a) || str(item.spade_a);
+    const result = { url, quality: qualityLabel(selected.quality || selected.key), key: spade ? deriveContentKey(spade) : null };
     streamCache.set(cacheKey, { time: Date.now(), value: result }); return result;
 }
 

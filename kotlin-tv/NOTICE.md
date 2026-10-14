@@ -5,7 +5,10 @@
 - drpys, `spider/js/红果果[短].js`
 - https://github.com/woshishiq1/drpys/tree/22261adfa31435e3b3ef5a730b8a2a75bcaf1715
 - 本仓库对照源：`../server/vendor/hongguo.cjs`，取回于 2026-09-21。
-- 本版改动：完整 Kotlin 实现；签名只选择已验证的 hash branch 0；加密媒体通过 Media3 DataSource 直接读取；增加样本边界检查、子样本处理和 AVC 原始编码恢复。
+- 轻量签名（X-Gorgon/X-Khronos）与随机设备身份、`video_model/v1` 取流、`landpage/v` 漫剧目录改编自
+  jipinwa/hongguo（`native/core/provider_hongguo_sign.go` / `provider_hongguo_app.go` / `provider_hongguo_native_media.go`）：
+  https://github.com/jipinwa/hongguo — 2026-10-13 移植，替换被平台封禁的 drpys 重签名链路。
+- 本版改动：完整 Kotlin 实现；加密媒体通过 Media3 DataSource 直接读取；增加样本边界检查、子样本处理和 AVC 原始编码恢复。
 
 `kotlin-tv/` 原生应用源码和派生实现以 GPL-3.0-only 发布，许可证全文见 `LICENSE`。发布 APK 时同时提供本分支对应源码、Gradle 包装器和构建说明。APK 不包含 Node、React Native、JavaScript 引擎或该 JavaScript 源文件。`tools/signing-oracle.cjs` 仅为开发期生成对照测试数据的工具，不参与应用构建或运行。
 

@@ -22,14 +22,11 @@ data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null)
 data class StreamInfo(val url: String, val key: ByteArray?, val quality: String)
-class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
-    private val signer = Signer()
+    private val lightSigner = SignerLight(clock)
     private val site = "https://hongguoduanju.com"
-    private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long)
-    private val searchCursors=linkedMapOf<Triple<ContentType,String,Int>,SearchCursor>()
-    private fun text(url: String, signed: Signer.Request? = null): String {
+    private fun text(url: String, signed: SignerLight.Request? = null): String {
         val request = Request.Builder().url(url).header("User-Agent",VendorConstants.VIDEO_UA).header("Accept-Language","zh-CN,zh;q=0.9")
         signed?.headers?.forEach { (k,v) -> request.header(k,v) }
         signed?.body?.let { request.post(it.toRequestBody("application/json; charset=utf-8".toMediaType())) }
@@ -45,10 +42,11 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     private fun router(url: String) = extractRouter(text(url)).getJSONObject("loaderData")
     private fun card(item: JSONObject): Series {
+        // Website rows use series_name/series_cover; landpage/v rows are flat (title/cover).
         val o=item.optJSONObject("video_data") ?: item
         val count=o.optInt("episode_cnt",o.optJSONObject("series_episode_info")?.optInt("episode_cnt",0) ?: 0)
         val tags=o.optJSONArray("tags") ?: o.optJSONArray("category_list") ?: JSONArray()
-        return Series(o.str("series_id"),o.str("series_name").ifEmpty { o.str("series_title").ifEmpty { item.str("name") } },cleanUrl(o.str("series_cover")),o.str("series_intro"),o.str("episode_right_text").ifEmpty { if(count>0) "全 ${count} 集" else "" },(0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optJSONObject(it)?.str("name") ?: tags.optString(it) })
+        return Series(o.str("series_id"),o.str("series_name").ifEmpty { o.str("series_title").ifEmpty { o.str("title").ifEmpty { item.str("name") } } },cleanUrl(o.str("series_cover").ifEmpty { o.str("cover") }),o.str("series_intro").ifEmpty { o.str("video_desc") },o.str("episode_right_text").ifEmpty { if(count>0) "全 ${count} 集" else "" },(0 until minOf(tags.length(),5)).joinToString(" · ") { tags.optJSONObject(it)?.str("name") ?: tags.optString(it) })
     }
     private fun valid(rows: List<Series>) = rows.filter { it.id.matches(Regex("[0-9]{1,30}")) && it.title.isNotBlank() }.distinctBy { it.id }
     fun comicRanking(page: Int = 1): CatalogPage {
@@ -67,53 +65,55 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     fun search(keyword: String, page: Int = 1, type: ContentType = ContentType.SHORT): CatalogPage {
         require(keyword.isNotBlank() && keyword.length<=80 && page in 1..100)
-        // The website search does not constrain content type. Never use it for comics.
-        if(type==ContentType.COMIC) return appSearch(keyword,page,type)
-        try { val result=appSearch(keyword,page,type); if(result.items.isNotEmpty() || !result.hasMore) return result } catch (e: Exception) { if(e is SearchSessionExpiredException) throw e; /* Website fallback for short dramas only. */ }
-        val data=router("$site/search/${Signer.encode(keyword)}?page=$page")
+        // The old search/tab/v endpoint returns an empty 200 for any signature now.
+        // Short dramas: website search. Comics: signed landpage catalog filtered by genre.
+        if(type==ContentType.COMIC) return comicCatalog(keyword,page)
+        val data=router("$site/search/${SignerLight.encode(keyword)}?page=$page")
         val section=data.optJSONObject("search_(keyword)/page") ?: data.optJSONObject("search_page") ?: throw IOException("搜索数据暂不可用")
         val rows=section.optJSONArray("searchList") ?: throw IOException("搜索数据结构已变化")
         val items=valid(rows.objects().map(::card))
         return CatalogPage(items,items.isNotEmpty() && page<100)
     }
-    private fun appSearch(keyword: String, page: Int, type: ContentType): CatalogPage {
-        val values=VendorConstants.device.toMutableMap()
-        for(k in listOf("version_code","manifest_version_code","update_version_code","pv_player")) values[k]="72232"
-        values["version_name"]="7.2.2.32"
-        values.putAll(linkedMapOf("query" to keyword,"count" to "20","offset" to ((page-1)*20).toString(),"tab_type" to type.searchTab.toString(),"bookshelf_search_plan" to "4","use_correct" to "true","user_is_login" to "0"))
-        val cursor=synchronized(searchCursors) {
-            val now=clock()
-            searchCursors.entries.removeAll { now-it.value.updatedAt>300000 || (page==1 && it.key.first==type && it.key.second==keyword) }
-            searchCursors[Triple(type,keyword,page-1)]
+    private fun comicCatalog(keyword: String, page: Int): CatalogPage {
+        // landpage/v cannot filter by title server-side; pull genre pages and match locally.
+        // Pagination beyond what we scanned reports no results rather than wrong ones.
+        val wanted=keyword.trim()
+        val collected= mutableListOf<Series>()
+        val maxScanPages=minOf(page+9,100)
+        for(scan in 1..maxScanPages) {
+            val rows=comicCatalogPage(scan)
+            collected+=valid(rows.objects().map(::card))
+            val hit=collected.filter { it.title.contains(wanted) || wanted.contains(it.title.take(12)) }.distinctBy { it.id }
+            if(hit.isNotEmpty() && scan>=page) return CatalogPage(hit,true)
         }
-        if(type==ContentType.COMIC && page>1 && cursor==null) throw SearchSessionExpiredException()
-        cursor?.let {
-            if(it.searchId.isNotBlank()) values["search_id"]=it.searchId
-            if(it.passback.isNotBlank()) values["passback"]=it.passback
-            it.offset?.takeIf { offset -> offset>=0 }?.let { offset -> values["offset"]=offset.toString() }
+        return CatalogPage(emptyList(),false)
+    }
+    private fun comicCatalogPage(page: Int): JSONArray {
+        val payload=JSONObject().apply {
+            put("req_scene","comic_series")
+            put("offset",(page-1)*20)
+            put("limit",20)
+            put("req_type","only_content")
+            put("need_selector_panel",false)
+            put("client_req_type",if(page>1) 2 else 3)
+            put("session_id","")
+            put("filter_ids","")
+            put("select_items",JSONObject().apply {
+                put("genre",JSONArray().put("comic_series"))
+                put("sort",JSONArray().put("online_time"))
+                put("gender",JSONArray())
+                put("category_dim_theme",JSONArray())
+                put("category_dim_role",JSONArray())
+                put("category_dim_epoch",JSONArray())
+                put("online_time",JSONArray())
+                put("creation_status",JSONArray())
+            })
         }
-        val signed=signer.sign("https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v",values)
+        val signed=lightSigner.sign("https://api5-normal-sinfonlineb.fqnovel.com/reading/distribution/category/landpage/v/",VendorConstants.device,payload.toString().toByteArray())
         val data=JSONObject(text(signed.url,signed))
-        if(data.optInt("code",-1)!=0) throw IOException("搜索接口暂不可用")
-        val tabs=data.optJSONArray("search_tabs") ?: data.optJSONObject("data")?.optJSONArray("search_tabs") ?: throw IOException("搜索格式异常")
-        val tab=tabs.objects().firstOrNull { it.optInt("tab_type")==type.searchTab } ?: throw IOException("${type.label}搜索暂不可用")
-        val list=mutableListOf<Series>()
-        for(cell in (tab.optJSONArray("data") ?: JSONArray()).objects()) {
-            val cells=mutableListOf(cell)
-            runCatching { JSONObject(cell.str("lynx_data")).optJSONArray("cell_data")?.objects() }.getOrNull()?.let { cells.addAll(it) }
-            for(row in cells) {
-                val video=row.optJSONArray("video_data")?.objects()?.firstOrNull() ?: continue
-                val id=video.str("series_id").ifEmpty { row.str("book_id").ifEmpty { row.str("search_result_id") } }
-                val title=row.optJSONObject("search_high_light")?.optJSONObject("title")?.str("text").orEmpty().ifEmpty { video.str("title").ifEmpty { row.str("cell_name") } }
-                val count=video.optInt("episode_cnt")
-                list+=Series(id,title,cleanUrl(video.str("cover").ifEmpty { video.str("cover_url") }),video.str("video_desc"),if(count>0) "全 $count 集" else video.str("rec_text"),video.str("sub_title"))
-            }
-        }
-        synchronized(searchCursors) {
-            searchCursors[Triple(type,keyword,page)]=SearchCursor(tab.str("search_id"),tab.str("passback"),tab.str("next_offset").toIntOrNull(),clock())
-            while(searchCursors.size>100) searchCursors.remove(searchCursors.keys.first())
-        }
-        return CatalogPage(valid(list),tab.optBoolean("has_more",false) && page<100)
+        if(data.optInt("code",-1)!=0 && data.optInt("Code",-1)!=0) throw IOException("漫剧目录暂不可用")
+        val section=data.optJSONObject("data") ?: throw IOException("漫剧目录格式异常")
+        return section.optJSONArray("video_data") ?: section.optJSONArray("cards") ?: JSONArray()
     }
     fun detail(id: String): Detail {
         require(id.matches(Regex("[0-9]{1,30}")))
@@ -125,28 +125,45 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
-        val payload="""{"biz_param":{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":["$id"]}}""".toByteArray()
-        val signed=signer.sign("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/",VendorConstants.device,payload)
+        // video_model/v1 returns the video_list directly (plain main_url, no fallback chain).
+        // The old multi_video_model -> fallback_api chain stopped returning data (empty 200).
+        val payload="""{"video_id":"$id","content_type":1,"biz_param":{"need_all_video_definition":true,"video_platform":3}}""".toByteArray()
+        val signed=lightSigner.sign("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/video_model/v1/",VendorConstants.device,payload)
         val data=JSONObject(text(signed.url,signed))
         if(data.optInt("Code",data.optInt("code",0))!=0) throw IOException("播放接口暂不可用")
-        val map=data.optJSONObject("data") ?: throw IOException("播放信息为空")
-        val entry=map.optJSONObject(id) ?: map.keys().asSequence().mapNotNull { map.optJSONObject(it) }.firstOrNull() ?: throw IOException("播放信息为空")
-        val model=entry.optJSONObject("video_model") ?: JSONObject(entry.str("video_model"))
-        val raw=model.opt("fallback_api")
-        val fallback=when(raw) { is JSONObject -> raw.str("fallback_api"); is JSONArray -> raw.optString(0); else -> runCatching { JSONObject(raw.toString()).str("fallback_api") }.getOrDefault(raw.toString()) }
-        if(!fallback.startsWith("https://")) throw IOException("播放地址格式异常")
-        val info=JSONObject(text(fallback)).optJSONObject("video_info")?.optJSONObject("data") ?: throw IOException("没有播放资源")
-        val videoList=info.optJSONObject("video_list") ?: throw IOException("没有可用清晰度")
-        // ByteVC2 resources can expose playable audio but no video track in Android's MP4 extractor.
-        // Keep missing legacy codec labels usable, but never select a known incompatible variant.
-        val rows=videoList.keys().asSequence().mapNotNull { k -> videoList.optJSONObject(k)?.let { k to it } }.filter {
-            it.second.str("main_url").isNotEmpty() && it.second.str("codec_type").lowercase() !in setOf("bytevc2","bvc2")
-        }.map { (k,o) -> Triple(qualityNumber(o.str("quality_desc").ifEmpty { o.str("height").ifEmpty { o.str("vheight").ifEmpty { o.str("quality").ifEmpty { k } } } }),k,o) }.sortedByDescending { it.first }.toList()
-        val selected=rows.firstOrNull { it.first<=maxQuality } ?: rows.lastOrNull() ?: throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
-        val item=selected.third; var url=cleanUrl(item.str("main_url")); val seed=info.str("key_seed")
-        if(seed.isNotEmpty()) url=MediaCrypto.decryptUrl(url,decode64(seed))
+        val dataObj=data.optJSONObject("data") ?: throw IOException("播放信息为空")
+        val rawModel=dataObj.opt("video_model")
+        val model=when(rawModel) { is JSONObject -> rawModel; else -> runCatching { JSONObject(rawModel.toString()) }.getOrElse { throw IOException("播放信息格式异常") } }
+        // video_list may be a JSONObject keyed by quality or a plain JSONArray.
+        val entries: List<Pair<String,JSONObject>> =when(val rawList=model.opt("video_list")) {
+            is JSONObject -> rawList.keys().asSequence().mapNotNull { k -> rawList.optJSONObject(k)?.let { k to it } }.toList()
+            is JSONArray -> (0 until rawList.length()).mapNotNull { i -> rawList.optJSONObject(i)?.let { "$i" to it } }
+            else -> emptyList()
+        }
+        val rows=entries.filter {
+            (it.second.str("main_url").isNotEmpty() || it.second.optJSONObject("encrypt_info")?.str("spade_a")?.let { spade -> spade.isNotEmpty() } == true) &&
+                it.second.str("codec_type").lowercase() !in setOf("bytevc2","bvc2")
+        }.map { (k,o) ->
+            val meta=o.optJSONObject("video_meta") ?: JSONObject()
+            val q=qualityNumber(o.str("quality_desc").ifEmpty { o.str("definition").ifEmpty { meta.str("definition").ifEmpty { meta.str("vheight").ifEmpty { o.str("vheight").ifEmpty { k } } } } })
+            Triple(q,k,o)
+        }.sortedWith(compareByDescending<Triple<Int,String,JSONObject>> { it.first }.thenBy { if (it.third.str("codec_type").lowercase() in setOf("h264","avc1","")) 0 else 1 }).toList()
+        val selected=rows.firstOrNull { it.first in 1..maxQuality } ?: rows.lastOrNull() ?: throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
+        val item=selected.third
+        var url=cleanUrl(item.str("main_url"))
+        if(url.isEmpty()) {
+            // Encoded entries may hide the address behind base64; try decoding the string forms.
+            val enc=item.optJSONObject("encrypt_info")
+            val candidate=enc?.str("main_url") ?: item.str("backup_url")
+            if(candidate.isNotEmpty()) {
+                val decoded=runCatching { String(decode64(candidate),Charsets.UTF_8) }.getOrDefault("")
+                if(decoded.startsWith("http")) url=cleanUrl(decoded)
+            }
+        }
         if(!url.startsWith("https://") && !url.startsWith("http://")) throw IOException("播放地址无效")
-        val key=item.str("spade_a").takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
+        val encryption=item.optJSONObject("encrypt_info")
+        val spade=encryption?.str("spade_a") ?: item.str("spade_a")
+        val key=spade.takeIf { it.isNotEmpty() }?.let(MediaCrypto::deriveKey)
         val quality=if(selected.first>0) "${selected.first}P"+(if(selected.first>maxQuality) "（兼容资源）" else "") else "自动"
         return StreamInfo(url,key,quality)
     }

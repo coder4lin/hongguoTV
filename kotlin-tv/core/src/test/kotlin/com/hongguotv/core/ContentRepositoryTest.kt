@@ -5,6 +5,8 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
+
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -17,7 +19,12 @@ class ContentRepositoryTest {
             val rows=JSONObject()
             variants.forEachIndexed { index,(height,codec,url) -> rows.put("video_$index",JSONObject().put("vheight",height).put("codec_type",codec).put("main_url",url)) }
             JSONObject().put("video_info",JSONObject().put("data",JSONObject().put("video_list",rows))).toString()
-        } else """{"data":{"123":{"video_model":{"fallback_api":"https://example.com/stream"}}}}"""
+        } else {
+            assertEquals("/novel/player/video_model/v1/",request.url.encodedPath)
+            val rows=JSONObject()
+            variants.forEachIndexed { index,(height,codec,url) -> rows.put("$index",JSONObject().put("video_meta",JSONObject().put("vheight",height)).put("codec_type",codec).put("main_url",url)) }
+            JSONObject().put("code",0).put("data",JSONObject().put("video_model",JSONObject().put("video_list",rows))).toString()
+        }
     }
 
     @Test fun incompatibleByteVc2DoesNotBecomeAudioOnlyPlayback() {
@@ -159,37 +166,19 @@ class ContentRepositoryTest {
         assertTrue(page.hasMore)
     }
 
-    @Test fun comicSearchCarriesCursorAndKeepsTypesAndQueriesSeparate() {
-        val requests=mutableListOf<Request>()
+    @Test fun comicSearchMatchesGenreCatalogLocallyWithoutCursors() {
+        val bodies=mutableListOf<String>()
         val repo=repository { request ->
-            requests+=request
-            JSONObject().put("code",0).put("search_tabs",JSONArray().put(searchTab(19,"999")
-                .put("search_id","comic-session").put("passback","comic-cursor").put("next_offset",25))).toString()
+            assertEquals("/reading/distribution/category/landpage/v/",request.url.encodedPath)
+            val body=request.body?.let { b -> val sink=okio.Buffer(); b.writeTo(sink); sink.readUtf8() } ?: ""
+            bodies+=body
+            JSONObject().put("code",0).put("data",JSONObject()
+                .put("video_data",landpageRows("999" to "修仙漫剧","888" to "其他漫剧"))).toString()
         }
-        repo.search("修仙",1,ContentType.COMIC)
-        repo.search("修仙",2,ContentType.COMIC)
-        assertEquals("comic-session",requests[1].url.queryParameter("search_id"))
-        assertEquals("comic-cursor",requests[1].url.queryParameter("passback"))
-        assertEquals("25",requests[1].url.queryParameter("offset"))
-        assertThrows(SearchSessionExpiredException::class.java) { repo.search("重生",2,ContentType.COMIC) }
-        assertEquals(2,requests.size)
-    }
-
-    @Test fun expiredCursorRequestsFreshSearchInsteadOfDuplicateOffsetPage() {
-        var now=0L
-        var requests=0
-        val repo=repository(clock={ now }) {
-            requests++
-            JSONObject().put("code",0).put("search_tabs",JSONArray().put(searchTab(19,"999")
-                .put("search_id","session").put("passback","cursor"))).toString()
-        }
-        repo.search("修仙",1,ContentType.COMIC)
-        now=300001L
-        assertThrows(SearchSessionExpiredException::class.java) { repo.search("修仙",2,ContentType.COMIC) }
-        assertEquals(1,requests)
-        repo.search("修仙",1,ContentType.COMIC)
-        repo.search("修仙",2,ContentType.COMIC)
-        assertEquals(3,requests)
+        assertEquals(listOf("999"),repo.search("修仙",1,ContentType.COMIC).items.map { it.id })
+        assertEquals(0,JSONObject(bodies.single()).getInt("offset"))
+        // No session cursors exist any more: repeated searches are independent.
+        assertEquals(listOf("999"),repo.search("修仙",2,ContentType.COMIC).items.map { it.id })
     }
 
     @Test fun shortHomeStillUsesCategoryAndStopsOnLastPage() {
@@ -202,46 +191,38 @@ class ContentRepositoryTest {
         assertFalse(result.hasMore)
     }
 
-    private fun searchTab(type: Int,id: String) = JSONObject().put("tab_type",type).put("has_more",true)
-        .put("data",JSONArray().put(JSONObject().put("video_data",JSONArray().put(JSONObject()
-            .put("series_id",id).put("title","测试剧集").put("episode_cnt",8)))))
+    private fun landpageRows(vararg ids: Pair<String,String>) = JSONArray().apply {
+        ids.forEach { (id,title) -> put(JSONObject().put("series_id",id).put("title",title).put("episode_cnt",8).put("cover","https://example.com/c.jpg")) }
+    }
 
-    @Test fun comicSearchRequestsAndSelectsOnlyComicTab() {
-        var requests=0
+    @Test fun comicSearchScansGenreCatalogAndMatchesTitles() {
+        val bodies=mutableListOf<String>()
         val repo=repository { request ->
-            requests++
-            assertEquals("19",request.url.queryParameter("tab_type"))
-            assertEquals(if(requests==1) "0" else "20",request.url.queryParameter("offset"))
-            assertEquals("修仙",request.url.queryParameter("query"))
-            JSONObject().put("code",0).put("search_tabs",JSONArray()
-                .put(searchTab(11,"111")).put(searchTab(19,"999"))).toString()
+            assertEquals("/reading/distribution/category/landpage/v/",request.url.encodedPath)
+            val body=request.body?.let { b -> val sink=okio.Buffer(); b.writeTo(sink); sink.readUtf8() } ?: ""
+            bodies+=body
+            JSONObject().put("code",0).put("data",JSONObject()
+                .put("video_data",landpageRows("999" to "修仙漫剧","888" to "其他漫剧"))).toString()
         }
-        repo.search("修仙",1,ContentType.COMIC)
-        assertEquals(listOf("999"),repo.search("修仙",2,ContentType.COMIC).items.map { it.id })
+        val result=repo.search("修仙",1,ContentType.COMIC)
+        assertEquals(listOf("999"),result.items.map { it.id })
+        assertEquals(0,JSONObject(bodies.single()).getInt("offset"))
+        assertEquals("comic_series",JSONObject(bodies.single()).getJSONObject("select_items").getJSONArray("genre").getString(0))
     }
 
-    @Test fun emptyComicSearchDoesNotFallBackToShortResults() {
-        var requests=0
-        val repo=repository { requests++; """{"code":0,"search_tabs":[{"tab_type":19,"data":[],"has_more":false}]}""" }
-        assertTrue(repo.search("无结果",1,ContentType.COMIC).items.isEmpty())
-        assertEquals(1,requests)
+    @Test fun comicSearchMissReportsEmptyWithoutServerFallback() {
+        val repo=repository {
+            JSONObject().put("code",0).put("data",JSONObject()
+                .put("video_data",landpageRows("888" to "无关漫剧"))).toString()
+        }
+        assertTrue(repo.search("不存在",1,ContentType.COMIC).items.isEmpty())
     }
 
-    @Test fun missingComicTabDoesNotFallBackToShortResults() {
-        var requests=0
-        val repo=repository { requests++; """{"code":0,"search_tabs":[{"tab_type":11,"data":[]}]}""" }
-        assertThrows(IOException::class.java) { repo.search("修仙",1,ContentType.COMIC) }
-        assertEquals(1,requests)
-    }
-
-    @Test fun shortSearchKeepsWebsiteFallback() {
-        val paths=mutableListOf<String>()
+    @Test fun shortSearchUsesWebsiteDirectly() {
         val repo=repository { request ->
-            paths+=request.url.encodedPath
-            if(paths.size==1) throw IOException("offline")
+            assertEquals("/search/%E7%9F%AD%E5%89%A7",request.url.encodedPath)
             """<script>_ROUTER_DATA={"loaderData":{"search_page":{"searchList":[{"series_id":"456","series_name":"测试短剧"}]}}}};</script>"""
         }
         assertEquals("456",repo.search("短剧",1,ContentType.SHORT).items.single().id)
-        assertEquals(2,paths.size)
     }
 }
